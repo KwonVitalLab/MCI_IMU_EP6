@@ -1,5 +1,5 @@
 # MCI_IMU_EP6
-# Predicting Cognitive and Balance Scores from Waist-Mounted IMU Data
+## Wearable sensing for quantifying cognitive and balance functions in naturalistic movements of older adults with mild cognitive impairment in therapeutic environments
 
 This repository contains the analysis pipeline for our study on estimating clinical assessment scores — MoCA (cognition) and Mini-BESTest (balance) — from waist-mounted IMU recordings collected during unstructured break and lunch periods of the CEP. 
 Gait and signal features are extracted from short windows of accelerometer/gyroscope data, tree-based regressors are trained with nested, subject-aware cross-validation, and the resulting models are examined for feature importance (SHAP) and demographic fairness.
