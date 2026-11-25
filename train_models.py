@@ -22,6 +22,22 @@ WHAT THIS SCRIPT DOES
     Supports SLURM job arrays (SLURM_ARRAY_TASK_ID selects one
     (dataset, target) unit) and a reduced smoke_test mode. All paths, targets,
     CV settings, and search spaces come from config.yaml.
+
+REVISION ADDITIONS
+    - Outer/inner CV folds are reshuffled per rep at the SUBJECT level.
+      (Before: GroupKFold ignores row order, so all reps had identical splits.)
+    - Optuna TPE sampler is seeded -> reproducible tuning.
+    - Everything needed for post-hoc revision analyses is saved under
+      {output_path}/predictions/ for EVERY (dataset, target, model):
+        subject_preds_*.csv   out-of-fold SubjectTime-level preds per rep/fold,
+                              + n_windows, window-pred std/median, mean-baseline
+        window_preds_*.csv.gz out-of-fold window-level preds + window metadata
+                              (VisitIndex, CohortProgramDay, ...)
+        fold_summary_*.csv    per rep/fold: test/train/baseline RMSE, best params,
+                              inner-CV RMSE, test subjects
+        run_metadata_*.json   config snapshot, package versions, seeds
+    - Checkpoints use a new tag, so checkpoints from the previous run are NOT
+      resumed (they contain no predictions).
 """
 
 import os
@@ -59,18 +75,76 @@ CONFIG_PATH =  os.path.join(ROOT_PATH, 'config.yaml')
 _MP_CTX = mp.get_context("spawn")
 
 
+# ─── Revision run settings ───
+# True: reshuffle subject->fold assignment every rep (true repeated CV).
+SHUFFLE_GROUP_FOLDS = True
+SAVE_FOLD_MODELS = True
+
+# Window-level metadata kept in the prediction files.
+META_COLS = [
+    "Subject", "Cohort", "Time", "SubjectTime",
+    "VisitIndex", "CohortProgramDay",
+    "Window Start TimeOfDay", "Window Start Elapsed (s)",
+]
+
+
+def subject_group_folds(subjects, n_splits, seed):
+    """Yield (train_idx, test_idx) positional indices with no subject leakage.
+
+    With SHUFFLE_GROUP_FOLDS, unique subjects are permuted with `seed` and dealt
+    round-robin into `n_splits` folds, so each rep gets a different split and
+    folds have (near-)equal numbers of subjects. sklearn's GroupKFold is
+    deterministic in the groups (row shuffling does not change it), which made
+    every rep use the same split.
+    """
+    subjects = pd.Series(np.asarray(subjects))
+    if not SHUFFLE_GROUP_FOLDS:
+        yield from GroupKFold(n_splits=n_splits).split(
+            np.zeros(len(subjects)), groups=subjects
+        )
+        return
+    uniq = np.array(sorted(subjects.unique(), key=str))
+    perm = np.random.default_rng(seed).permutation(uniq)
+    fold_of = {s: i % n_splits for i, s in enumerate(perm)}
+    fold_ids = subjects.map(fold_of).to_numpy()
+    for k in range(n_splits):
+        yield np.flatnonzero(fold_ids != k), np.flatnonzero(fold_ids == k)
+
+
+def aggregate_subject_level(subject_time, y_true, window_preds):
+    """Window predictions -> SubjectTime level (mean, as in the paper), keeping
+    the number of windows and the spread of window predictions (R1.3)."""
+    df = pd.DataFrame({
+        'subject_time': np.asarray(subject_time),
+        'true': np.asarray(y_true, dtype=float),
+        'pred': np.asarray(window_preds, dtype=float).ravel(),
+    })
+    return df.groupby('subject_time').agg(
+        true=('true', 'mean'),
+        pred=('pred', 'mean'),
+        pred_median=('pred', 'median'),
+        pred_std=('pred', 'std'),
+        n_windows=('pred', 'size'),
+    )
+
+
+def _rmse(a, b):
+    return float(np.sqrt(mean_squared_error(a, b)))
+
+
 NON_FEATURE_COLS = [
     # identifiers / grouping keys
     "Subject", "Cohort", "Time", "SubjectTime",
     # de-identified window metadata 
     "VisitIndex", "CohortProgramDay",
     "Window Start TimeOfDay", "Window Start Elapsed (s)",
-    # legacy absolute-datetime column (harmless no-op if absent)
+    # legacy
     "Window Start Datetime",
 ]
 
 
 def safe_clone(model):
+
     """Return an unfitted clone of `model`.
 
     Falls back to re-instantiation from get_params() if sklearn's clone returns
@@ -89,7 +163,8 @@ def safe_clone(model):
 # =============================================================================
 # CROSS VALIDATION
 # =============================================================================
-def run_cross_validation(X, y, subjects, subject_time, reps, folds, model_instance, suggested_params):
+def run_cross_validation(X, y, subjects, subject_time, reps, folds, model_instance, suggested_params,
+                         seed=0):
     """
     Repeated GroupKFold cross-validation with per-fold normalization.
  
@@ -116,16 +191,15 @@ def run_cross_validation(X, y, subjects, subject_time, reps, folds, model_instan
     model.set_params(**suggested_params)
  
     for rep in tqdm(range(reps), desc="CV Reps", leave=False):
-        indices = np.arange(len(X))
-        np.random.shuffle(indices)
+        rep_seed = seed + rep
+        indices = np.random.default_rng(rep_seed).permutation(len(X))
         X_shuffled = X.iloc[indices]
         y_shuffled = y.iloc[indices]
         subjects_shuffled = subjects.iloc[indices]
         subject_time_shuffled = subject_time.iloc[indices]
- 
-        # GroupKFold splits by Subject
-        gkf = GroupKFold(n_splits=folds)
-        for train_index, val_index in gkf.split(X_shuffled, y_shuffled, subjects_shuffled):
+
+        # Subject-level folds (same seed for every Optuna trial -> fair comparison)
+        for train_index, val_index in subject_group_folds(subjects_shuffled, folds, rep_seed):
             X_fold_train = X_shuffled.iloc[train_index]
             X_fold_val   = X_shuffled.iloc[val_index]
             y_fold_train = y_shuffled.iloc[train_index]
@@ -170,7 +244,7 @@ def run_cross_validation(X, y, subjects, subject_time, reps, folds, model_instan
 
 def run_hyperparam_tuning(X, y, subjects, subject_time, model_instance, model_name,
                           params_search_space, config, folds=5, reps=5, n_trials=30,
-                          study_suffix="", run_final_eval=False):
+                          study_suffix="", run_final_eval=False, seed=0):
     log_dir = os.path.join(ROOT_PATH, 'log')
     os.makedirs(log_dir, exist_ok=True)
     # Unique study name per outer fold + rep
@@ -206,7 +280,8 @@ def run_hyperparam_tuning(X, y, subjects, subject_time, model_instance, model_na
             reps=reps,
             folds=folds,
             model_instance=model_instance,
-            suggested_params=params_suggested_by_trial
+            suggested_params=params_suggested_by_trial,
+            seed=seed
         )
  
         return np.mean(final_rmse_scores) if final_rmse_scores else float('inf')
@@ -223,7 +298,8 @@ def run_hyperparam_tuning(X, y, subjects, subject_time, model_instance, model_na
                   f"Stopping {model_name} on '{y.name}'.")
  
     study = optuna.create_study(
-        direction='minimize'
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=seed),
     )
  
     study.optimize(
@@ -241,7 +317,11 @@ def run_hyperparam_tuning(X, y, subjects, subject_time, model_instance, model_na
     print(f"Best hyperparameters: {best_params}")
 
     if not run_final_eval:
-        return best_params, None, None, None, None
+        tuning_info = {
+            "best_inner_rmse": float(best_trial.value),
+            "n_trials_run": len(study.trials),
+        }
+        return best_params, tuning_info, None, None, None
 
     # Re-run final repeated CV with best params for the performance report
     final_rmse_scores, final_true, final_pred, final_ids = run_cross_validation(
@@ -252,7 +332,8 @@ def run_hyperparam_tuning(X, y, subjects, subject_time, model_instance, model_na
         reps=reps,
         folds=folds,
         model_instance=model_instance,
-        suggested_params=best_params
+        suggested_params=best_params,
+        seed=seed
     )
  
     mean_rmse    = np.mean(final_rmse_scores)
@@ -324,7 +405,7 @@ def _outer_fold_worker(payload):
 
     model_instance = build_model(payload['model_name'], payload['random_seed'])
 
-    best_params, _, _, _, _ = run_hyperparam_tuning(
+    best_params, tuning_info, _, _, _ = run_hyperparam_tuning(
         X=payload['X_outer_train'],
         y=payload['y_outer_train'],
         subjects=payload['subjects_outer_train'],
@@ -336,11 +417,12 @@ def _outer_fold_worker(payload):
         folds=payload['inner_folds'],
         reps=1,  # inner reps=1; outer reps handle repetition
         n_trials=payload['n_trials'],
-        study_suffix=payload['study_suffix']
+        study_suffix=payload['study_suffix'],
+        seed=payload['inner_seed'],
     )
 
     # ─── Train on full outer train, evaluate on outer test ───
-    X_train_norm, X_test_norm, _ = normalize_features(
+    X_train_norm, X_test_norm, fold_scaler = normalize_features(
         train_data=payload['X_outer_train'],
         test_data=payload['X_outer_test'],
         feature_cols=payload['feature_cols']
@@ -350,27 +432,83 @@ def _outer_fold_worker(payload):
     final_model.set_params(**best_params)
     final_model.fit(X_train_norm, payload['y_outer_train'])
 
-    window_preds = final_model.predict(X_test_norm)
+    # ─── Save this outer-fold model (weights + everything needed to reuse it) ───
+    fold_model_path = payload.get('fold_model_path')
+    if fold_model_path:
+        joblib.dump({
+            'model': final_model,
+            'scaler': fold_scaler,
+            'feature_cols': payload['feature_cols'],
+            'best_params': best_params,
+            'test_subjects': [str(s) for s in pd.unique(payload['subjects_outer_test'])],
+            'train_subjects': [str(s) for s in pd.unique(payload['subjects_outer_train'])],
+        }, fold_model_path, compress=3)
+
+    window_preds = np.asarray(final_model.predict(X_test_norm), dtype=float).ravel()
 
     # Aggregate by SubjectTime
-    eval_df = pd.DataFrame({
-        'subject_time': payload['subject_time_outer_test'].values,
-        'true': payload['y_outer_test'].values,
-        'pred': window_preds
-    })
-    subject_level = eval_df.groupby('subject_time').mean()
+    subject_level = aggregate_subject_level(
+        payload['subject_time_outer_test'], payload['y_outer_test'], window_preds
+    )
+    fold_rmse = _rmse(subject_level['true'], subject_level['pred'])
 
-    fold_rmse = float(np.sqrt(
-        mean_squared_error(subject_level['true'], subject_level['pred'])
-    ))
+    # In-sample (outer-train) error
+    train_window_preds = np.asarray(final_model.predict(X_train_norm), dtype=float).ravel()
+    train_level = aggregate_subject_level(
+        payload['subject_time_outer_train'], payload['y_outer_train'], train_window_preds
+    )
+    train_rmse = _rmse(train_level['true'], train_level['pred'])
+
+    # Mean-predictor baseline
+    train_label_mean = float(train_level['true'].mean())
+    baseline_rmse = _rmse(subject_level['true'], np.full(len(subject_level), train_label_mean))
+    subject_level['pred_baseline_mean'] = train_label_mean
+
+    window_df = pd.DataFrame({
+        'row_id': np.asarray(payload['row_ids_outer_test']),
+        'true': np.asarray(payload['y_outer_test'], dtype=float),
+        'pred': window_preds,
+    })
 
     return {
         'best_params': best_params,
         'fold_rmse': fold_rmse,
+        'train_rmse': train_rmse,
+        'baseline_rmse': baseline_rmse,
+        'best_inner_rmse': tuning_info['best_inner_rmse'],
+        'n_trials_run': tuning_info['n_trials_run'],
         'subject_true': subject_level['true'].tolist(),
         'subject_pred': subject_level['pred'].tolist(),
         'subject_times': subject_level.index.tolist(),
+        'subject_df': subject_level.reset_index(),
+        'window_df': window_df,
     }
+
+
+def _save_run_metadata(path, config, extra):
+    """Config snapshot + package versions so the final run is reproducible."""
+    from importlib import metadata
+    import datetime
+    import platform
+    versions = {}
+    for pkg in ["numpy", "pandas", "scikit-learn", "xgboost", "catboost",
+                "cuml", "optuna", "scipy"]:
+        try:
+            versions[pkg] = metadata.version(pkg)
+        except Exception:
+            versions[pkg] = None
+    meta = {
+        "shuffle_group_folds": SHUFFLE_GROUP_FOLDS,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "python": platform.python_version(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "versions": versions,
+        "config": config,
+        **extra,
+    }
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2, default=str)
 
 
 def main(smoke_test=False):
@@ -391,6 +529,13 @@ def main(smoke_test=False):
     # Make checkpoints
     checkpoint_dir = os.path.join(output_path, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Revision prediction outputs
+    preds_dir = os.path.join(output_path, f"predictions")
+    os.makedirs(preds_dir, exist_ok=True)
+    fold_models_dir = os.path.join(output_path, f"fold_models")
+    if SAVE_FOLD_MODELS:
+        os.makedirs(fold_models_dir, exist_ok=True)
 
     # Smoke test configs; otherwise, use the default configs
     if smoke_test:
@@ -492,6 +637,13 @@ def main(smoke_test=False):
                 subjects     = df.loc[X.index, 'Subject']
                 subject_time = df.loc[X.index, 'SubjectTime']
 
+                # Window metadata keyed by original row id (df index), carried
+                # through the shuffles so window preds can be mapped back.
+                meta = df.loc[X.index, [c for c in META_COLS if c in df.columns]]
+                row_ids = pd.Series(X.index.to_numpy(), name='row_id')
+                st_map = (meta.drop_duplicates('SubjectTime')
+                              .set_index('SubjectTime')[['Subject', 'Time']])
+
                 
                 nan_counts = X.isna().sum()
                 nan_features = nan_counts[nan_counts > 0]
@@ -500,7 +652,7 @@ def main(smoke_test=False):
                     for feat, count in nan_features.sort_values(ascending=False).items():
                         print(f"    {feat}: {count:,} ({100*count/len(X):.1f}%)")
                 print(f"-----------------------------------\n")
- 
+
                 n_subjects = subjects.nunique()
                 n_subject_times = subject_time.nunique()
  
@@ -537,23 +689,25 @@ def main(smoke_test=False):
                     all_outer_pred = []
                     all_outer_subject_times = []
                     all_best_params = []
- 
+                    subject_frames = []
+                    window_frames = []
+                    fold_rows = []
+
                     for rep in range(reps):
                         print(f"\n--- Rep {rep+1}/{reps} ---")
- 
-                        indices = np.arange(len(X))
-                        np.random.seed(random_seed + rep)
-                        np.random.shuffle(indices)
+
+                        rep_seed = random_seed + rep
+                        indices = np.random.default_rng(rep_seed).permutation(len(X))
                         X_shuffled            = X.iloc[indices].reset_index(drop=True)
                         y_shuffled            = y.iloc[indices].reset_index(drop=True)
                         y_shuffled.name       = y.name
                         subjects_shuffled     = subjects.iloc[indices].reset_index(drop=True)
                         subject_time_shuffled = subject_time.iloc[indices].reset_index(drop=True)
- 
-                        # ─── Outer loop: GroupKFold by Subject ───
-                        outer_gkf = GroupKFold(n_splits=outer_folds)
+                        row_ids_shuffled      = row_ids.iloc[indices].reset_index(drop=True)
+
+                        # ─── Outer loop: subject-level folds, reshuffled per rep ───
                         for fold_idx, (outer_train_idx, outer_test_idx) in enumerate(
-                            outer_gkf.split(X_shuffled, y_shuffled, subjects_shuffled)
+                            subject_group_folds(subjects_shuffled, outer_folds, rep_seed)
                         ):
                             print(f"  Outer Fold {fold_idx+1}/{outer_folds}")
  
@@ -582,6 +736,15 @@ def main(smoke_test=False):
                                 'X_outer_test': X_outer_test,
                                 'y_outer_test': y_outer_test,
                                 'subject_time_outer_test': subject_time_outer_test,
+                                'row_ids_outer_test': row_ids_shuffled.iloc[outer_test_idx],
+                                'inner_seed': random_seed + 1000 * (rep + 1) + fold_idx,
+                                'subjects_outer_test': subjects_outer_test,
+                                'fold_model_path': (
+                                    os.path.join(fold_models_dir,
+                                                 f"{name}_{target}_{model_name}_{suffix}"
+                                                 f"_rep{rep}_fold{fold_idx}.joblib")
+                                    if SAVE_FOLD_MODELS else None
+                                ),
                                 'feature_cols': X.columns.tolist(),
                                 'search_space': current_search_space,
                                 'config': config,
@@ -598,7 +761,72 @@ def main(smoke_test=False):
                             all_outer_pred.extend(fold_result['subject_pred'])
                             all_outer_subject_times.extend(fold_result['subject_times'])
 
-                            print(f"    Outer Fold RMSE: {fold_result['fold_rmse']:.4f}")
+                            # ─── Revision logging ───
+                            sub_df = fold_result['subject_df']
+                            sub_df.insert(0, 'rep', rep)
+                            sub_df.insert(1, 'fold', fold_idx)
+                            subject_frames.append(sub_df)
+
+                            win_df = fold_result['window_df']
+                            win_df.insert(0, 'rep', rep)
+                            win_df.insert(1, 'fold', fold_idx)
+                            window_frames.append(win_df)
+
+                            fold_rows.append({
+                                'rep': rep,
+                                'fold': fold_idx,
+                                'n_test_subjects': len(test_subjects),
+                                'test_subjects': json.dumps([str(s) for s in test_subjects]),
+                                'test_rmse': fold_result['fold_rmse'],
+                                'train_rmse': fold_result['train_rmse'],
+                                'baseline_mean_rmse': fold_result['baseline_rmse'],
+                                'best_inner_rmse': fold_result['best_inner_rmse'],
+                                'n_trials_run': fold_result['n_trials_run'],
+                                'best_params': json.dumps(fold_result['best_params'], default=str),
+                            })
+
+                            print(f"    Outer Fold RMSE: {fold_result['fold_rmse']:.4f} "
+                                  f"(train {fold_result['train_rmse']:.4f}, "
+                                  f"mean-baseline {fold_result['baseline_rmse']:.4f})")
+
+                    # ─── Save revision prediction files (before checkpointing) ───
+                    unit_tag = f"{name}_{target}_{model_name}_{suffix}"
+
+                    subj_all = pd.concat(subject_frames, ignore_index=True)
+                    subj_all = subj_all.merge(st_map, left_on='subject_time',
+                                              right_index=True, how='left')
+                    subj_all.insert(0, 'dataset', name)
+                    subj_all.insert(1, 'target', target)
+                    subj_all.insert(2, 'model', model_name)
+                    subj_all.to_csv(os.path.join(preds_dir, f"subject_preds_{unit_tag}.csv"),
+                                    index=False)
+
+                    win_all = pd.concat(window_frames, ignore_index=True)
+                    win_all = win_all.merge(meta, left_on='row_id', right_index=True, how='left')
+                    win_all.insert(0, 'dataset', name)
+                    win_all.insert(1, 'target', target)
+                    win_all.insert(2, 'model', model_name)
+                    win_all.to_csv(os.path.join(preds_dir, f"window_preds_{unit_tag}.csv.gz"),
+                                   index=False, compression='gzip')
+
+                    fold_df = pd.DataFrame(fold_rows)
+                    fold_df.insert(0, 'dataset', name)
+                    fold_df.insert(1, 'target', target)
+                    fold_df.insert(2, 'model', model_name)
+                    fold_df.to_csv(os.path.join(preds_dir, f"fold_summary_{unit_tag}.csv"),
+                                   index=False)
+
+                    _save_run_metadata(
+                        os.path.join(preds_dir, f"run_metadata_{unit_tag}.json"),
+                        config,
+                        {"dataset": name, "target": target, "model": model_name,
+                         "outer_folds": outer_folds, "inner_folds": inner_folds,
+                         "reps": reps, "n_trials": n_trials,
+                         "n_subjects": int(n_subjects),
+                         "n_subject_times": int(n_subject_times),
+                         "n_windows": int(len(X))},
+                    )
+                    print(f"[PREDS] Saved subject/window/fold files for {unit_tag} to {preds_dir}")
  
                     # ─── Aggregate results across all reps and outer folds ───
                     mean_rmse = np.mean(all_outer_rmses)
@@ -664,6 +892,14 @@ def main(smoke_test=False):
                         models_path, f"{model_name}_{name}_{target}_{suffix}.joblib"
                     )
                     joblib.dump(final_model_all, model_path)
+                    # Scaler for the all-data model (was not saved before). Separate
+                    # file so run_shap.py's model-loading format is unchanged.
+                    joblib.dump(
+                        {'scaler': final_scaler, 'feature_cols': X.columns.tolist(),
+                         'best_params': final_best_params},
+                        os.path.join(models_path,
+                                     f"{model_name}_{name}_{target}_{suffix}_scaler.joblib"),
+                    )
                     print(f"Final model saved to: {model_path}")
  
                     perf_entry = {
@@ -677,6 +913,8 @@ def main(smoke_test=False):
                                 "std_error": std_err
                             },
                             "best_params": final_best_params,
+                            "mean_train_rmse": float(fold_df['train_rmse'].mean()),
+                            "mean_baseline_mean_rmse": float(fold_df['baseline_mean_rmse'].mean()),
                         }
                     }
                     model_performance.append(perf_entry)

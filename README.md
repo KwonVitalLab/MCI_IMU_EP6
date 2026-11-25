@@ -62,6 +62,11 @@ python analyze_fairness.py   # 6
    Barycenter post-processing as mitigation. Writes `fairness_result_*.csv` to
    `results/fairness/`.
 
+7. **`revision_analysis.py`** - Performs additional analyses for revision process.
+
+8. **`permutation_test.py`** - Performs the permutation test to verify if the results 
+   are statistically meaningful after mixing the signals and labels.
+
 ### Supporting files
 
 - **`config.yaml`** — All paths, target/exclusion lists, windowing parameters, CV
